@@ -1,0 +1,143 @@
+name: Build VoidLink IPA
+
+# 手动触发：Actions 页面 -> Build VoidLink IPA -> Run workflow
+# 如需推送自动构建，取消下面 push 段的注释（会消耗 macOS 构建额度）
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "构建配置（Release 体积小性能好，Debug 便于看日志）"
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      branch:
+        description: "源码分支"
+        type: string
+        default: Integration
+
+#  push:
+#    branches: [ Integration ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || 'Integration' }}
+          fetch-depth: 1
+
+      # 工程依赖 4 个 submodule：moonlight-common-c / X1Kit / imgui / moonlight-audio-haptics
+      - name: Fetch submodules
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          echo "--- submodule 状态 ---"
+          git submodule status
+
+      # 工程 objectVersion = 70 + PBXFileSystemSynchronized，需要 Xcode 16 及以上
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      # 上游 Integration 分支没有提交共享 scheme，这里补一个再构建
+      - name: Inject shared scheme
+        run: |
+          set -euo pipefail
+          SCHEME_DIR="VoidLink.xcodeproj/xcshareddata/xcschemes"
+          mkdir -p "$SCHEME_DIR"
+          cp .github/schemes/VoidLink.xcscheme "$SCHEME_DIR/VoidLink.xcscheme"
+          echo "--- 可用 scheme ---"
+          xcodebuild -list -project VoidLink.xcodeproj
+
+      - name: Resolve Swift packages
+        run: |
+          set -o pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project VoidLink.xcodeproj \
+            -scheme VoidLink 2>&1 | tail -30
+
+      - name: Archive (unsigned)
+        env:
+          BUILD_CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
+        run: |
+          set -o pipefail
+          # CURRENT_PROJECT_VERSION 在工程里被写成了字母 x，会导致 CFBundleVersion 非法装不上，
+          # 这里用运行序号覆盖，保证每次构建号递增、可覆盖安装。
+          xcodebuild archive \
+            -project VoidLink.xcodeproj \
+            -scheme VoidLink \
+            -configuration "$BUILD_CONFIG" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/VoidLink.xcarchive" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -quiet 2>&1 | tee archive.log
+          echo "--- archive 产物 ---"
+          ls -la "$PWD/build/VoidLink.xcarchive/Products/Applications/"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/VoidLink.xcarchive/Products/Applications/VoidLink.app"
+          test -d "$APP" || { echo "找不到 VoidLink.app"; exit 1; }
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/VoidLink.app
+          cd build/ipa
+          zip -qry ../VoidLink-unsigned.ipa Payload
+          cd ../..
+          ls -lh build/VoidLink-unsigned.ipa
+
+      - name: Verify IPA
+        run: |
+          set -euo pipefail
+          unzip -l build/VoidLink-unsigned.ipa | head -15
+          PLIST="build/ipa/Payload/VoidLink.app/Info.plist"
+          echo "bundle id      : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          echo "version        : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          echo "build number   : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
+          echo "min iOS        : $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PLIST" 2>/dev/null || echo '(由构建系统注入)')"
+          echo "device family  : $(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" 2>/dev/null | tr '\n' ' ' || echo '-')"
+          echo "架构           : $(lipo -archs 'build/ipa/Payload/VoidLink.app/VoidLink' 2>/dev/null || echo '-')"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoidLink-ipa-${{ github.run_number }}
+          path: build/VoidLink-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: archive.log
+          if-no-files-found: ignore
+          retention-days: 7
